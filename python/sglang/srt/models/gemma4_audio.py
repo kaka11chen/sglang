@@ -89,7 +89,9 @@ class Gemma4AudioRelativePositionEmbedding(nn.Module):
             float(max_timescale) / float(min_timescale)
         ) / max(num_timescales - 1, 1)
         inv_timescales = min_timescale * torch.exp(
-            torch.arange(num_timescales) * -log_timescale_increment
+            # Model construction may use a BF16 default dtype. Match the
+            # checkpoint's FP32 frequency initialization before casting.
+            torch.arange(num_timescales, dtype=torch.float32) * -log_timescale_increment
         )
         self.register_buffer(
             "inv_timescales",
@@ -101,9 +103,9 @@ class Gemma4AudioRelativePositionEmbedding(nn.Module):
         self, position: torch.Tensor, dtype: torch.dtype
     ) -> torch.Tensor:
         assert position.ndim == 2
-        position = position.float().unsqueeze(-1)
+        position = position.unsqueeze(-1)
         scaled_time = position * self.inv_timescales.to(
-            device=position.device, dtype=torch.float32
+            device=position.device, dtype=self.pos_proj.weight.dtype
         )
         timing_signal = torch.cat(
             [torch.sin(scaled_time), torch.cos(scaled_time)], dim=-1
@@ -808,23 +810,18 @@ class Gemma4AudioEncoder(nn.Module):
         chunk_size = config.attention_chunk_size
         max_future_horizon = config.attention_context_right
         max_past_horizon = max(0, config.attention_context_left - 1)
-        upper_diagonal = max_past_horizon + max_future_horizon
         context_size = chunk_size + max_past_horizon + max_future_horizon
-
-        lower_causal_mask = torch.tril(
-            torch.ones((context_size, chunk_size), dtype=torch.bool),
-            diagonal=0,
-        ).T
-        upper_causal_mask = torch.tril(
-            torch.ones((chunk_size, context_size), dtype=torch.bool),
-            diagonal=upper_diagonal,
-        )
-        local_causal_valid_mask = torch.ones(
-            (chunk_size, context_size), dtype=torch.bool
+        query_positions = max_past_horizon + torch.arange(chunk_size)[:, None]
+        key_positions = torch.arange(context_size)[None, :]
+        distance = query_positions - key_positions
+        # HF uses exclusive horizons. Keep the extraction/relative-shift
+        # layout intact and mask its extra boundary positions here.
+        local_causal_valid_mask = ((distance >= 0) & (distance < max_past_horizon)) | (
+            (distance < 0) & (-distance < max_future_horizon)
         )
         self.register_buffer(
             "causal_valid_mask",
-            local_causal_valid_mask * lower_causal_mask * upper_causal_mask,
+            local_causal_valid_mask,
             persistent=False,
         )
 
