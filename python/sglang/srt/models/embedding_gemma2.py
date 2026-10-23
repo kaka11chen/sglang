@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention.vision import VisionSdpaAttention
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
@@ -566,6 +567,12 @@ class EmbeddingGemma2Model(nn.Module):
             text_config.allow_global_per_layer_attribute_access = True
         self.text_config = text_config
 
+        self.vision_batch_size = envs.SGLANG_EMBEDDING_GEMMA2_VISION_BATCH_SIZE.get()
+        if self.vision_batch_size < 1:
+            raise ValueError(
+                "SGLANG_EMBEDDING_GEMMA2_VISION_BATCH_SIZE must be positive"
+            )
+
         try:
             limit_mm = get_mm().limit_mm_data_per_request or {}
         except Exception:  # noqa: BLE001
@@ -705,6 +712,25 @@ class EmbeddingGemma2Model(nn.Module):
             )
         vt = self.vision_tower
         all_embeds = []
+        pending_pixels = []
+        pending_positions = []
+
+        def encode_pending():
+            if not pending_pixels:
+                return
+            pooled, pooler_mask = vt(
+                torch.cat(pending_pixels, dim=0),
+                torch.cat(pending_positions, dim=0),
+            )
+            # Preserve the original per-frame projection and token order.
+            for hs, mask in zip(pooled, pooler_mask):
+                real_tokens = hs[mask]
+                all_embeds.append(
+                    self.embed_vision(inputs_embeds=real_tokens.unsqueeze(0)).squeeze(0)
+                )
+            pending_pixels.clear()
+            pending_positions.clear()
+
         for item in items:
             all_pixel_values = flatten_nested_list([item.feature])
             all_position_ids = flatten_nested_list(
@@ -712,6 +738,7 @@ class EmbeddingGemma2Model(nn.Module):
             )
             for pv_idx, pv in enumerate(all_pixel_values):
                 if pv.dim() in (2, 3) and pv.shape[-1] == self.text_config.hidden_size:
+                    encode_pending()
                     all_embeds.append(pv.to(self.language_model.device))
                     continue
                 if pv_idx >= len(all_position_ids) or all_position_ids[pv_idx] is None:
@@ -730,14 +757,17 @@ class EmbeddingGemma2Model(nn.Module):
                 pv = pv.to(device=vt.device, dtype=self.language_model.dtype())
                 pp = pp.to(device=vt.device)
 
-                pooled, pooler_mask = vt(pv, pp)
-                for hs, mask in zip(pooled, pooler_mask):
-                    real_tokens = hs[mask]
-                    all_embeds.append(
-                        self.embed_vision(
-                            inputs_embeds=real_tokens.unsqueeze(0)
-                        ).squeeze(0)
-                    )
+                for frame, positions in zip(pv.split(1), pp.split(1), strict=True):
+                    if pending_pixels and (
+                        frame.shape[1:] != pending_pixels[0].shape[1:]
+                        or positions.shape[1:] != pending_positions[0].shape[1:]
+                    ):
+                        encode_pending()
+                    pending_pixels.append(frame)
+                    pending_positions.append(positions)
+                    if len(pending_pixels) == self.vision_batch_size:
+                        encode_pending()
+        encode_pending()
         if all_embeds:
             return torch.cat(all_embeds, dim=0)
         else:
