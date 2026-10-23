@@ -1660,6 +1660,8 @@ class Envs:
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
     SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU = EnvBool(False)
     SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
+    # Frames per vision forward in EmbeddingGemma2 (independent of HTTP batches).
+    SGLANG_EMBEDDING_GEMMA2_VISION_BATCH_SIZE = EnvInt(4)
     SGLANG_ENCODER_PREPROC_WORKERS = EnvInt(8)
     SGLANG_ENCODER_MM_LOAD_WORKERS = EnvInt(4)
     # EncoderBootstrapServer health-check tuning.  Interval == 0 disables it.
